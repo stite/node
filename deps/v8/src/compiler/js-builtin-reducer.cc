@@ -9,6 +9,7 @@
 #include "src/code-factory.h"
 #include "src/compilation-dependencies.h"
 #include "src/compiler/access-builder.h"
+#include "src/compiler/allocation-builder.h"
 #include "src/compiler/js-graph.h"
 #include "src/compiler/linkage.h"
 #include "src/compiler/node-matchers.h"
@@ -120,6 +121,24 @@ MaybeHandle<Map> GetMapWitness(Node* node) {
   return MaybeHandle<Map>();
 }
 
+Maybe<InstanceType> GetInstanceTypeWitness(Node* node) {
+  ZoneHandleSet<Map> maps;
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &maps);
+
+  if (result == NodeProperties::kNoReceiverMaps || maps.size() == 0) {
+    return Nothing<InstanceType>();
+  }
+
+  InstanceType first_type = maps[0]->instance_type();
+  for (const Handle<Map>& map : maps) {
+    if (map->instance_type() != first_type) return Nothing<InstanceType>();
+  }
+  return Just(first_type);
+}
+
 // TODO(turbofan): This was copied from Crankshaft, might be too restrictive.
 bool IsReadOnlyLengthDescriptor(Handle<Map> jsarray_map) {
   DCHECK(!jsarray_map->is_dictionary_map());
@@ -148,7 +167,7 @@ bool CanInlineArrayResizeOperation(Handle<Map> receiver_map) {
          IsFastElementsKind(receiver_map->elements_kind()) &&
          !receiver_map->is_dictionary_map() && receiver_map->is_extensible() &&
          (!receiver_map->is_prototype_map() || receiver_map->is_stable()) &&
-         isolate->IsFastArrayConstructorPrototypeChainIntact() &&
+         isolate->IsNoElementsProtectorIntact() &&
          isolate->IsAnyInitialArrayPrototype(receiver_prototype) &&
          !IsReadOnlyLengthDescriptor(receiver_map);
 }
@@ -174,11 +193,12 @@ bool CanInlineJSArrayIteration(Handle<Map> receiver_map) {
     if (!current->map()->is_stable()) return false;
   }
 
-  // For holey Arrays, ensure that the array_protector cell is valid (must be
-  // a CompilationDependency), and the JSArray prototype has not been altered.
+  // For holey Arrays, ensure that the no_elements_protector cell is valid (must
+  // be a CompilationDependency), and the JSArray prototype has not been
+  // altered.
   return receiver_map->instance_type() == JS_ARRAY_TYPE &&
          (!receiver_map->is_dictionary_map() || receiver_map->is_stable()) &&
-         isolate->IsFastArrayConstructorPrototypeChainIntact() &&
+         isolate->IsNoElementsProtectorIntact() &&
          isolate->IsAnyInitialArrayPrototype(receiver_prototype);
 }
 
@@ -231,8 +251,9 @@ Reduction JSBuiltinReducer::ReduceArrayIterator(Handle<Map> receiver_map,
       Node* check = effect = graph()->NewNode(
           simplified()->ArrayBufferWasNeutered(), buffer, effect, control);
       check = graph()->NewNode(simplified()->BooleanNot(), check);
-      effect =
-          graph()->NewNode(simplified()->CheckIf(), check, effect, control);
+      effect = graph()->NewNode(
+          simplified()->CheckIf(DeoptimizeReason::kArrayBufferWasNeutered),
+          check, effect, control);
     }
   }
 
@@ -292,41 +313,27 @@ Reduction JSBuiltinReducer::ReduceArrayIterator(Handle<Map> receiver_map,
 
   Handle<Map> map(Map::cast(native_context()->get(map_index)), isolate());
 
-  // allocate new iterator
-  effect = graph()->NewNode(
-      common()->BeginRegion(RegionObservability::kNotObservable), effect);
-  Node* value = effect = graph()->NewNode(
-      simplified()->Allocate(Type::OtherObject(), NOT_TENURED),
-      jsgraph()->Constant(JSArrayIterator::kSize), effect, control);
-  effect = graph()->NewNode(simplified()->StoreField(AccessBuilder::ForMap()),
-                            value, jsgraph()->Constant(map), effect, control);
-  effect = graph()->NewNode(
-      simplified()->StoreField(AccessBuilder::ForJSObjectPropertiesOrHash()),
-      value, jsgraph()->EmptyFixedArrayConstant(), effect, control);
-  effect = graph()->NewNode(
-      simplified()->StoreField(AccessBuilder::ForJSObjectElements()), value,
-      jsgraph()->EmptyFixedArrayConstant(), effect, control);
+  // Allocate new iterator and attach the iterator to this object.
+  AllocationBuilder a(jsgraph(), effect, control);
+  a.Allocate(JSArrayIterator::kSize, NOT_TENURED, Type::OtherObject());
+  a.Store(AccessBuilder::ForMap(), map);
+  a.Store(AccessBuilder::ForJSObjectPropertiesOrHash(),
+          jsgraph()->EmptyFixedArrayConstant());
+  a.Store(AccessBuilder::ForJSObjectElements(),
+          jsgraph()->EmptyFixedArrayConstant());
+  a.Store(AccessBuilder::ForJSArrayIteratorObject(), receiver);
+  a.Store(AccessBuilder::ForJSArrayIteratorIndex(), jsgraph()->ZeroConstant());
+  a.Store(AccessBuilder::ForJSArrayIteratorObjectMap(), object_map);
+  Node* value = effect = a.Finish();
 
-  // attach the iterator to this object
-  effect = graph()->NewNode(
-      simplified()->StoreField(AccessBuilder::ForJSArrayIteratorObject()),
-      value, receiver, effect, control);
-  effect = graph()->NewNode(
-      simplified()->StoreField(AccessBuilder::ForJSArrayIteratorIndex()), value,
-      jsgraph()->ZeroConstant(), effect, control);
-  effect = graph()->NewNode(
-      simplified()->StoreField(AccessBuilder::ForJSArrayIteratorObjectMap()),
-      value, object_map, effect, control);
-
-  value = effect = graph()->NewNode(common()->FinishRegion(), value, effect);
-
-  // replace it
+  // Replace it.
   ReplaceWithValue(node, value, effect, control);
   return Replace(value);
 }
 
-Reduction JSBuiltinReducer::ReduceFastArrayIteratorNext(
-    Handle<Map> iterator_map, Node* node, IterationKind kind) {
+Reduction JSBuiltinReducer::ReduceFastArrayIteratorNext(InstanceType type,
+                                                        Node* node,
+                                                        IterationKind kind) {
   Node* iterator = NodeProperties::GetValueInput(node, 1);
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
@@ -339,16 +346,16 @@ Reduction JSBuiltinReducer::ReduceFastArrayIteratorNext(
     return NoChange();
   }
 
-  ElementsKind elements_kind = JSArrayIterator::ElementsKindForInstanceType(
-      iterator_map->instance_type());
+  ElementsKind elements_kind =
+      JSArrayIterator::ElementsKindForInstanceType(type);
 
   if (IsHoleyElementsKind(elements_kind)) {
-    if (!isolate()->IsFastArrayConstructorPrototypeChainIntact()) {
+    if (!isolate()->IsNoElementsProtectorIntact()) {
       return NoChange();
     } else {
       Handle<JSObject> initial_array_prototype(
           native_context()->initial_array_prototype(), isolate());
-      dependencies()->AssumePropertyCell(factory()->array_protector());
+      dependencies()->AssumePropertyCell(factory()->no_elements_protector());
     }
   }
 
@@ -400,8 +407,9 @@ Reduction JSBuiltinReducer::ReduceFastArrayIteratorNext(
                              iterator, etrue1, if_true1);
         Node* check_map = graph()->NewNode(simplified()->ReferenceEqual(),
                                            array_map, orig_map);
-        etrue1 = graph()->NewNode(simplified()->CheckIf(), check_map, etrue1,
-                                  if_true1);
+        etrue1 =
+            graph()->NewNode(simplified()->CheckIf(DeoptimizeReason::kWrongMap),
+                             check_map, etrue1, if_true1);
       }
 
       if (kind != IterationKind::kKeys) {
@@ -495,15 +503,16 @@ Reduction JSBuiltinReducer::ReduceFastArrayIteratorNext(
   return Replace(value);
 }
 
-Reduction JSBuiltinReducer::ReduceTypedArrayIteratorNext(
-    Handle<Map> iterator_map, Node* node, IterationKind kind) {
+Reduction JSBuiltinReducer::ReduceTypedArrayIteratorNext(InstanceType type,
+                                                         Node* node,
+                                                         IterationKind kind) {
   Node* iterator = NodeProperties::GetValueInput(node, 1);
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
   Node* context = NodeProperties::GetContextInput(node);
 
-  ElementsKind elements_kind = JSArrayIterator::ElementsKindForInstanceType(
-      iterator_map->instance_type());
+  ElementsKind elements_kind =
+      JSArrayIterator::ElementsKindForInstanceType(type);
 
   Node* array = effect = graph()->NewNode(
       simplified()->LoadField(AccessBuilder::ForJSArrayIteratorObject()),
@@ -540,8 +549,9 @@ Reduction JSBuiltinReducer::ReduceTypedArrayIteratorNext(
       Node* check1 = efalse0 = graph()->NewNode(
           simplified()->ArrayBufferWasNeutered(), buffer, efalse0, if_false0);
       check1 = graph()->NewNode(simplified()->BooleanNot(), check1);
-      efalse0 =
-          graph()->NewNode(simplified()->CheckIf(), check1, efalse0, if_false0);
+      efalse0 = graph()->NewNode(
+          simplified()->CheckIf(DeoptimizeReason::kArrayBufferWasNeutered),
+          check1, efalse0, if_false0);
     }
 
     Node* length = efalse0 = graph()->NewNode(
@@ -735,65 +745,58 @@ Reduction JSBuiltinReducer::ReduceTypedArrayToStringTag(Node* node) {
 }
 
 Reduction JSBuiltinReducer::ReduceArrayIteratorNext(Node* node) {
-  Handle<Map> receiver_map;
-  if (GetMapWitness(node).ToHandle(&receiver_map)) {
-    switch (receiver_map->instance_type()) {
-      case JS_TYPED_ARRAY_KEY_ITERATOR_TYPE:
-        return ReduceTypedArrayIteratorNext(receiver_map, node,
-                                            IterationKind::kKeys);
+  Maybe<InstanceType> maybe_type = GetInstanceTypeWitness(node);
+  if (!maybe_type.IsJust()) return NoChange();
+  InstanceType type = maybe_type.FromJust();
+  switch (type) {
+    case JS_TYPED_ARRAY_KEY_ITERATOR_TYPE:
+      return ReduceTypedArrayIteratorNext(type, node, IterationKind::kKeys);
 
-      case JS_FAST_ARRAY_KEY_ITERATOR_TYPE:
-        return ReduceFastArrayIteratorNext(receiver_map, node,
-                                           IterationKind::kKeys);
+    case JS_FAST_ARRAY_KEY_ITERATOR_TYPE:
+      return ReduceFastArrayIteratorNext(type, node, IterationKind::kKeys);
 
-      case JS_INT8_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_UINT8_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_INT16_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_UINT16_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_INT32_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_UINT32_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_FLOAT32_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_FLOAT64_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_UINT8_CLAMPED_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-        return ReduceTypedArrayIteratorNext(receiver_map, node,
-                                            IterationKind::kEntries);
+    case JS_INT8_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_UINT8_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_INT16_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_UINT16_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_INT32_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_UINT32_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_FLOAT32_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_FLOAT64_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_UINT8_CLAMPED_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+      return ReduceTypedArrayIteratorNext(type, node, IterationKind::kEntries);
 
-      case JS_FAST_SMI_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_HOLEY_SMI_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_HOLEY_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_DOUBLE_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_HOLEY_DOUBLE_ARRAY_KEY_VALUE_ITERATOR_TYPE:
-        return ReduceFastArrayIteratorNext(receiver_map, node,
-                                           IterationKind::kEntries);
+    case JS_FAST_SMI_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_HOLEY_SMI_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_HOLEY_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_DOUBLE_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_HOLEY_DOUBLE_ARRAY_KEY_VALUE_ITERATOR_TYPE:
+      return ReduceFastArrayIteratorNext(type, node, IterationKind::kEntries);
 
-      case JS_INT8_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_UINT8_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_INT16_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_UINT16_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_INT32_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_UINT32_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_FLOAT32_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_FLOAT64_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_UINT8_CLAMPED_ARRAY_VALUE_ITERATOR_TYPE:
-        return ReduceTypedArrayIteratorNext(receiver_map, node,
-                                            IterationKind::kValues);
+    case JS_INT8_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_UINT8_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_INT16_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_UINT16_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_INT32_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_UINT32_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_FLOAT32_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_FLOAT64_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_UINT8_CLAMPED_ARRAY_VALUE_ITERATOR_TYPE:
+      return ReduceTypedArrayIteratorNext(type, node, IterationKind::kValues);
 
-      case JS_FAST_SMI_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_HOLEY_SMI_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_HOLEY_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_DOUBLE_ARRAY_VALUE_ITERATOR_TYPE:
-      case JS_FAST_HOLEY_DOUBLE_ARRAY_VALUE_ITERATOR_TYPE:
-        return ReduceFastArrayIteratorNext(receiver_map, node,
-                                           IterationKind::kValues);
+    case JS_FAST_SMI_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_HOLEY_SMI_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_HOLEY_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_DOUBLE_ARRAY_VALUE_ITERATOR_TYPE:
+    case JS_FAST_HOLEY_DOUBLE_ARRAY_VALUE_ITERATOR_TYPE:
+      return ReduceFastArrayIteratorNext(type, node, IterationKind::kValues);
 
-      default:
-        // Slow array iterators are not reduced
-        return NoChange();
-    }
+    default:
+      // Slow array iterators are not reduced
+      return NoChange();
   }
-  return NoChange();
 }
 
 // ES6 section 22.1.2.2 Array.isArray ( arg )
@@ -919,7 +922,7 @@ Reduction JSBuiltinReducer::ReduceArrayPop(Node* node) {
       receiver_map->elements_kind() != HOLEY_DOUBLE_ELEMENTS) {
     // Install code dependencies on the {receiver} prototype maps and the
     // global array protector cell.
-    dependencies()->AssumePropertyCell(factory()->array_protector());
+    dependencies()->AssumePropertyCell(factory()->no_elements_protector());
     dependencies()->AssumePrototypeMapsStable(receiver_map);
 
     // Load the "length" property of the {receiver}.
@@ -1002,6 +1005,11 @@ Reduction JSBuiltinReducer::ReduceArrayPop(Node* node) {
 // ES6 section 22.1.3.18 Array.prototype.push ( )
 Reduction JSBuiltinReducer::ReduceArrayPush(Node* node) {
   DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
   int const num_values = node->op()->ValueInputCount() - 2;
   Node* receiver = NodeProperties::GetValueInput(node, 1);
   Node* effect = NodeProperties::GetEffectInput(node);
@@ -1023,7 +1031,7 @@ Reduction JSBuiltinReducer::ReduceArrayPush(Node* node) {
 
     // Install code dependencies on the {receiver} prototype maps and the
     // global array protector cell.
-    dependencies()->AssumePropertyCell(factory()->array_protector());
+    dependencies()->AssumePropertyCell(factory()->no_elements_protector());
     dependencies()->AssumePrototypeMapsStable(receiver_map);
 
     // If the {receiver_maps} information is not reliable, we need
@@ -1032,12 +1040,9 @@ Reduction JSBuiltinReducer::ReduceArrayPush(Node* node) {
       if (receiver_map->is_stable()) {
         dependencies()->AssumeMapStable(receiver_map);
       } else {
-        // TODO(turbofan): This is a potential - yet unlikely - deoptimization
-        // loop, since we might not learn from this deoptimization in baseline
-        // code. We need a way to learn from deoptimizations in optimized to
-        // address these problems.
         effect = graph()->NewNode(
-            simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps),
+            simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps,
+                                    p.feedback()),
             receiver, effect, control);
       }
     }
@@ -1052,11 +1057,11 @@ Reduction JSBuiltinReducer::ReduceArrayPush(Node* node) {
     // Array.prototype.push inlining for this function.
     for (auto& value : values) {
       if (IsSmiElementsKind(receiver_map->elements_kind())) {
-        value = effect =
-            graph()->NewNode(simplified()->CheckSmi(), value, effect, control);
+        value = effect = graph()->NewNode(simplified()->CheckSmi(p.feedback()),
+                                          value, effect, control);
       } else if (IsDoubleElementsKind(receiver_map->elements_kind())) {
-        value = effect = graph()->NewNode(simplified()->CheckNumber(), value,
-                                          effect, control);
+        value = effect = graph()->NewNode(
+            simplified()->CheckNumber(p.feedback()), value, effect, control);
         // Make sure we do not store signaling NaNs into double arrays.
         value = graph()->NewNode(simplified()->NumberSilenceNaN(), value);
       }
@@ -1092,7 +1097,8 @@ Reduction JSBuiltinReducer::ReduceArrayPush(Node* node) {
               ? GrowFastElementsMode::kDoubleElements
               : GrowFastElementsMode::kSmiOrObjectElements;
       elements = effect = graph()->NewNode(
-          simplified()->MaybeGrowFastElements(mode), receiver, elements,
+          simplified()->MaybeGrowFastElements(mode, p.feedback()), receiver,
+          elements,
           graph()->NewNode(simplified()->NumberAdd(), length,
                            jsgraph()->Constant(num_values - 1)),
           elements_length, effect, control);
@@ -1139,7 +1145,7 @@ Reduction JSBuiltinReducer::ReduceArrayShift(Node* node) {
       receiver_map->elements_kind() != HOLEY_DOUBLE_ELEMENTS) {
     // Install code dependencies on the {receiver} prototype maps and the
     // global array protector cell.
-    dependencies()->AssumePropertyCell(factory()->array_protector());
+    dependencies()->AssumePropertyCell(factory()->no_elements_protector());
     dependencies()->AssumePrototypeMapsStable(receiver_map);
 
     // Load length of the {receiver}.
@@ -1194,6 +1200,8 @@ Reduction JSBuiltinReducer::ReduceArrayShift(Node* node) {
         Node* loop = graph()->NewNode(common()->Loop(2), if_true1, if_true1);
         Node* eloop =
             graph()->NewNode(common()->EffectPhi(2), etrue1, etrue1, loop);
+        Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
+        NodeProperties::MergeControlToEnd(graph(), common(), terminate);
         Node* index = graph()->NewNode(
             common()->Phi(MachineRepresentation::kTagged, 2),
             jsgraph()->OneConstant(),
@@ -1263,9 +1271,10 @@ Reduction JSBuiltinReducer::ReduceArrayShift(Node* node) {
         Node* argc =
             jsgraph()->Constant(BuiltinArguments::kNumExtraArgsWithReceiver);
         if_false1 = efalse1 = vfalse1 =
-            graph()->NewNode(common()->Call(desc), stub_code, receiver, argc,
-                             target, jsgraph()->UndefinedConstant(), entry,
-                             argc, context, frame_state, efalse1, if_false1);
+            graph()->NewNode(common()->Call(desc), stub_code, receiver,
+                             jsgraph()->PaddingConstant(), argc, target,
+                             jsgraph()->UndefinedConstant(), entry, argc,
+                             context, frame_state, efalse1, if_false1);
       }
 
       if_false0 = graph()->NewNode(common()->Merge(2), if_true1, if_false1);
@@ -1338,27 +1347,17 @@ Reduction JSBuiltinReducer::ReduceCollectionIterator(
         receiver, effect, control);
 
     // Create the JSCollectionIterator result.
-    effect = graph()->NewNode(
-        common()->BeginRegion(RegionObservability::kNotObservable), effect);
-    Node* value = effect = graph()->NewNode(
-        simplified()->Allocate(Type::OtherObject(), NOT_TENURED),
-        jsgraph()->Constant(JSCollectionIterator::kSize), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForMap()), value,
-        jsgraph()->Constant(collection_iterator_map), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSObjectPropertiesOrHash()),
-        value, jsgraph()->EmptyFixedArrayConstant(), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSObjectElements()), value,
-        jsgraph()->EmptyFixedArrayConstant(), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSCollectionIteratorTable()),
-        value, table, effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSCollectionIteratorIndex()),
-        value, jsgraph()->ZeroConstant(), effect, control);
-    value = effect = graph()->NewNode(common()->FinishRegion(), value, effect);
+    AllocationBuilder a(jsgraph(), effect, control);
+    a.Allocate(JSCollectionIterator::kSize, NOT_TENURED, Type::OtherObject());
+    a.Store(AccessBuilder::ForMap(), collection_iterator_map);
+    a.Store(AccessBuilder::ForJSObjectPropertiesOrHash(),
+            jsgraph()->EmptyFixedArrayConstant());
+    a.Store(AccessBuilder::ForJSObjectElements(),
+            jsgraph()->EmptyFixedArrayConstant());
+    a.Store(AccessBuilder::ForJSCollectionIteratorTable(), table);
+    a.Store(AccessBuilder::ForJSCollectionIteratorIndex(),
+            jsgraph()->ZeroConstant());
+    Node* value = effect = a.Finish();
     ReplaceWithValue(node, value, effect, control);
     return Replace(value);
   }
@@ -1386,7 +1385,7 @@ Reduction JSBuiltinReducer::ReduceCollectionSize(
 }
 
 Reduction JSBuiltinReducer::ReduceCollectionIteratorNext(
-    Node* node, int entry_size,
+    Node* node, int entry_size, Handle<HeapObject> empty_collection,
     InstanceType collection_iterator_instance_type_first,
     InstanceType collection_iterator_instance_type_last) {
   DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
@@ -1434,6 +1433,8 @@ Reduction JSBuiltinReducer::ReduceCollectionIteratorNext(
         graph()->NewNode(common()->Loop(2), control, control);
     Node* eloop = effect =
         graph()->NewNode(common()->EffectPhi(2), effect, effect, loop);
+    Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
+    NodeProperties::MergeControlToEnd(graph(), common(), terminate);
 
     // Check if reached the final table of the {receiver}.
     Node* table = effect = graph()->NewNode(
@@ -1466,6 +1467,7 @@ Reduction JSBuiltinReducer::ReduceCollectionIteratorNext(
     index = effect = graph()->NewNode(
         common()->Call(desc), jsgraph()->HeapConstant(callable.code()), table,
         index, jsgraph()->NoContextConstant(), effect);
+    NodeProperties::SetType(index, type_cache_.kFixedArrayLengthType);
 
     // Update the {index} and {table} on the {receiver}.
     effect = graph()->NewNode(
@@ -1522,6 +1524,8 @@ Reduction JSBuiltinReducer::ReduceCollectionIteratorNext(
     Node* loop = graph()->NewNode(common()->Loop(2), control, control);
     Node* eloop =
         graph()->NewNode(common()->EffectPhi(2), effect, effect, loop);
+    Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
+    NodeProperties::MergeControlToEnd(graph(), common(), terminate);
     Node* iloop = graph()->NewNode(
         common()->Phi(MachineRepresentation::kTagged, 2), index, index, loop);
     NodeProperties::SetType(iloop, type_cache_.kFixedArrayLengthType);
@@ -1538,9 +1542,8 @@ Reduction JSBuiltinReducer::ReduceCollectionIteratorNext(
         efalse0 = graph()->NewNode(
             simplified()->StoreField(
                 AccessBuilder::ForJSCollectionIteratorTable()),
-            receiver,
-            jsgraph()->HeapConstant(factory()->empty_ordered_hash_table()),
-            efalse0, if_false0);
+            receiver, jsgraph()->HeapConstant(empty_collection), efalse0,
+            if_false0);
 
         controls[0] = if_false0;
         effects[0] = efalse0;
@@ -1675,114 +1678,6 @@ Reduction JSBuiltinReducer::ReduceDateGetTime(Node* node) {
     Node* value = effect = graph()->NewNode(
         simplified()->LoadField(AccessBuilder::ForJSDateValue()), receiver,
         effect, control);
-    ReplaceWithValue(node, value, effect, control);
-    return Replace(value);
-  }
-  return NoChange();
-}
-
-// ES6 section 19.2.3.2 Function.prototype.bind ( thisArg, ...args )
-Reduction JSBuiltinReducer::ReduceFunctionBind(Node* node) {
-  // Value inputs to the {node} are as follows:
-  //
-  //  - target, which is Function.prototype.bind JSFunction
-  //  - receiver, which is the [[BoundTargetFunction]]
-  //  - bound_this (optional), which is the [[BoundThis]]
-  //  - and all the remaining value inouts are [[BoundArguments]]
-  Node* receiver = NodeProperties::GetValueInput(node, 1);
-  Type* receiver_type = NodeProperties::GetType(receiver);
-  Node* bound_this = (node->op()->ValueInputCount() < 3)
-                         ? jsgraph()->UndefinedConstant()
-                         : NodeProperties::GetValueInput(node, 2);
-  Node* effect = NodeProperties::GetEffectInput(node);
-  Node* control = NodeProperties::GetControlInput(node);
-  if (receiver_type->IsHeapConstant() &&
-      receiver_type->AsHeapConstant()->Value()->IsJSFunction()) {
-    Handle<JSFunction> target_function =
-        Handle<JSFunction>::cast(receiver_type->AsHeapConstant()->Value());
-
-    // Check that the "length" property on the {target_function} is the
-    // default JSFunction accessor.
-    LookupIterator length_lookup(target_function, factory()->length_string(),
-                                 target_function, LookupIterator::OWN);
-    if (length_lookup.state() != LookupIterator::ACCESSOR ||
-        !length_lookup.GetAccessors()->IsAccessorInfo()) {
-      return NoChange();
-    }
-
-    // Check that the "name" property on the {target_function} is the
-    // default JSFunction accessor.
-    LookupIterator name_lookup(target_function, factory()->name_string(),
-                               target_function, LookupIterator::OWN);
-    if (name_lookup.state() != LookupIterator::ACCESSOR ||
-        !name_lookup.GetAccessors()->IsAccessorInfo()) {
-      return NoChange();
-    }
-
-    // Determine the prototype of the {target_function}.
-    Handle<Object> prototype(target_function->map()->prototype(), isolate());
-
-    // Setup the map for the JSBoundFunction instance.
-    Handle<Map> map = target_function->IsConstructor()
-                          ? isolate()->bound_function_with_constructor_map()
-                          : isolate()->bound_function_without_constructor_map();
-    if (map->prototype() != *prototype) {
-      map = Map::TransitionToPrototype(map, prototype);
-    }
-    DCHECK_EQ(target_function->IsConstructor(), map->is_constructor());
-
-    // Create the [[BoundArguments]] for the result.
-    Node* bound_arguments = jsgraph()->EmptyFixedArrayConstant();
-    if (node->op()->ValueInputCount() > 3) {
-      int const length = node->op()->ValueInputCount() - 3;
-      effect = graph()->NewNode(
-          common()->BeginRegion(RegionObservability::kNotObservable), effect);
-      bound_arguments = effect = graph()->NewNode(
-          simplified()->Allocate(Type::OtherInternal(), NOT_TENURED),
-          jsgraph()->Constant(FixedArray::SizeFor(length)), effect, control);
-      effect = graph()->NewNode(
-          simplified()->StoreField(AccessBuilder::ForMap()), bound_arguments,
-          jsgraph()->FixedArrayMapConstant(), effect, control);
-      effect = graph()->NewNode(
-          simplified()->StoreField(AccessBuilder::ForFixedArrayLength()),
-          bound_arguments, jsgraph()->Constant(length), effect, control);
-      for (int i = 0; i < length; ++i) {
-        effect = graph()->NewNode(
-            simplified()->StoreField(AccessBuilder::ForFixedArraySlot(i)),
-            bound_arguments, NodeProperties::GetValueInput(node, 3 + i), effect,
-            control);
-      }
-      bound_arguments = effect =
-          graph()->NewNode(common()->FinishRegion(), bound_arguments, effect);
-    }
-
-    // Create the JSBoundFunction result.
-    effect = graph()->NewNode(
-        common()->BeginRegion(RegionObservability::kNotObservable), effect);
-    Node* value = effect = graph()->NewNode(
-        simplified()->Allocate(Type::BoundFunction(), NOT_TENURED),
-        jsgraph()->Constant(JSBoundFunction::kSize), effect, control);
-    effect = graph()->NewNode(simplified()->StoreField(AccessBuilder::ForMap()),
-                              value, jsgraph()->Constant(map), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSObjectPropertiesOrHash()),
-        value, jsgraph()->EmptyFixedArrayConstant(), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSObjectElements()), value,
-        jsgraph()->EmptyFixedArrayConstant(), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(
-            AccessBuilder::ForJSBoundFunctionBoundTargetFunction()),
-        value, receiver, effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSBoundFunctionBoundThis()),
-        value, bound_this, effect, control);
-    effect =
-        graph()->NewNode(simplified()->StoreField(
-                             AccessBuilder::ForJSBoundFunctionBoundArguments()),
-                         value, bound_arguments, effect, control);
-    value = effect = graph()->NewNode(common()->FinishRegion(), value, effect);
-
     ReplaceWithValue(node, value, effect, control);
     return Replace(value);
   }
@@ -2379,73 +2274,51 @@ Reduction JSBuiltinReducer::ReduceObjectCreate(Node* node) {
   Node* control = NodeProperties::GetControlInput(node);
   Node* prototype = NodeProperties::GetValueInput(node, 2);
   Type* prototype_type = NodeProperties::GetType(prototype);
-  Handle<Map> instance_map;
   if (!prototype_type->IsHeapConstant()) return NoChange();
   Handle<HeapObject> prototype_const =
       prototype_type->AsHeapConstant()->Value();
-  if (!prototype_const->IsNull(isolate()) && !prototype_const->IsJSReceiver()) {
-    return NoChange();
-  }
-  instance_map = Map::GetObjectCreateMap(prototype_const);
+  Handle<Map> instance_map;
+  MaybeHandle<Map> maybe_instance_map =
+      Map::TryGetObjectCreateMap(prototype_const);
+  if (!maybe_instance_map.ToHandle(&instance_map)) return NoChange();
   Node* properties = jsgraph()->EmptyFixedArrayConstant();
   if (instance_map->is_dictionary_map()) {
     // Allocated an empty NameDictionary as backing store for the properties.
-    Handle<Map> map(isolate()->heap()->hash_table_map(), isolate());
+    Handle<Map> map(isolate()->heap()->name_dictionary_map(), isolate());
     int capacity =
         NameDictionary::ComputeCapacity(NameDictionary::kInitialCapacity);
     DCHECK(base::bits::IsPowerOfTwo(capacity));
     int length = NameDictionary::EntryToIndex(capacity);
     int size = NameDictionary::SizeFor(length);
 
-    effect = graph()->NewNode(
-        common()->BeginRegion(RegionObservability::kNotObservable), effect);
-
-    Node* value = effect =
-        graph()->NewNode(simplified()->Allocate(Type::Any(), NOT_TENURED),
-                         jsgraph()->Constant(size), effect, control);
-    effect =
-        graph()->NewNode(simplified()->StoreField(AccessBuilder::ForMap()),
-                         value, jsgraph()->HeapConstant(map), effect, control);
-
+    AllocationBuilder a(jsgraph(), effect, control);
+    a.Allocate(size, NOT_TENURED, Type::Any());
+    a.Store(AccessBuilder::ForMap(), map);
     // Initialize FixedArray fields.
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForFixedArrayLength()), value,
-        jsgraph()->SmiConstant(length), effect, control);
+    a.Store(AccessBuilder::ForFixedArrayLength(),
+            jsgraph()->SmiConstant(length));
     // Initialize HashTable fields.
-    effect =
-        graph()->NewNode(simplified()->StoreField(
-                             AccessBuilder::ForHashTableBaseNumberOfElements()),
-                         value, jsgraph()->SmiConstant(0), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(
-            AccessBuilder::ForHashTableBaseNumberOfDeletedElement()),
-        value, jsgraph()->SmiConstant(0), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForHashTableBaseCapacity()),
-        value, jsgraph()->SmiConstant(capacity), effect, control);
+    a.Store(AccessBuilder::ForHashTableBaseNumberOfElements(),
+            jsgraph()->SmiConstant(0));
+    a.Store(AccessBuilder::ForHashTableBaseNumberOfDeletedElement(),
+            jsgraph()->SmiConstant(0));
+    a.Store(AccessBuilder::ForHashTableBaseCapacity(),
+            jsgraph()->SmiConstant(capacity));
     // Initialize Dictionary fields.
-    Node* undefined = jsgraph()->UndefinedConstant();
-    effect = graph()->NewNode(
-        simplified()->StoreField(
-            AccessBuilder::ForDictionaryNextEnumerationIndex()),
-        value, jsgraph()->SmiConstant(PropertyDetails::kInitialIndex), effect,
-        control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForDictionaryObjectHashIndex()),
-        value, jsgraph()->SmiConstant(PropertyArray::kNoHashSentinel), effect,
-        control);
+    a.Store(AccessBuilder::ForDictionaryNextEnumerationIndex(),
+            jsgraph()->SmiConstant(PropertyDetails::kInitialIndex));
+    a.Store(AccessBuilder::ForDictionaryObjectHashIndex(),
+            jsgraph()->SmiConstant(PropertyArray::kNoHashSentinel));
     // Initialize the Properties fields.
+    Node* undefined = jsgraph()->UndefinedConstant();
     STATIC_ASSERT(NameDictionary::kElementsStartIndex ==
                   NameDictionary::kObjectHashIndex + 1);
     for (int index = NameDictionary::kElementsStartIndex; index < length;
          index++) {
-      effect = graph()->NewNode(
-          simplified()->StoreField(
-              AccessBuilder::ForFixedArraySlot(index, kNoWriteBarrier)),
-          value, undefined, effect, control);
+      a.Store(AccessBuilder::ForFixedArraySlot(index, kNoWriteBarrier),
+              undefined);
     }
-    properties = effect =
-        graph()->NewNode(common()->FinishRegion(), value, effect);
+    properties = effect = a.Finish();
   }
 
   int const instance_size = instance_map->instance_size();
@@ -2454,80 +2327,24 @@ Reduction JSBuiltinReducer::ReduceObjectCreate(Node* node) {
 
   // Emit code to allocate the JSObject instance for the given
   // {instance_map}.
-  effect = graph()->NewNode(
-      common()->BeginRegion(RegionObservability::kNotObservable), effect);
-  Node* value = effect =
-      graph()->NewNode(simplified()->Allocate(Type::Any(), NOT_TENURED),
-                       jsgraph()->Constant(instance_size), effect, control);
-  effect =
-      graph()->NewNode(simplified()->StoreField(AccessBuilder::ForMap()), value,
-                       jsgraph()->HeapConstant(instance_map), effect, control);
-  effect = graph()->NewNode(
-      simplified()->StoreField(AccessBuilder::ForJSObjectPropertiesOrHash()),
-      value, properties, effect, control);
-  effect = graph()->NewNode(
-      simplified()->StoreField(AccessBuilder::ForJSObjectElements()), value,
-      jsgraph()->EmptyFixedArrayConstant(), effect, control);
+  AllocationBuilder a(jsgraph(), effect, control);
+  a.Allocate(instance_size, NOT_TENURED, Type::Any());
+  a.Store(AccessBuilder::ForMap(), instance_map);
+  a.Store(AccessBuilder::ForJSObjectPropertiesOrHash(), properties);
+  a.Store(AccessBuilder::ForJSObjectElements(),
+          jsgraph()->EmptyFixedArrayConstant());
   // Initialize Object fields.
   Node* undefined = jsgraph()->UndefinedConstant();
   for (int offset = JSObject::kHeaderSize; offset < instance_size;
        offset += kPointerSize) {
-    effect = graph()->NewNode(
-        simplified()->StoreField(
-            AccessBuilder::ForJSObjectOffset(offset, kNoWriteBarrier)),
-        value, undefined, effect, control);
+    a.Store(AccessBuilder::ForJSObjectOffset(offset, kNoWriteBarrier),
+            undefined);
   }
-  value = effect = graph()->NewNode(common()->FinishRegion(), value, effect);
+  Node* value = effect = a.Finish();
 
   // replace it
   ReplaceWithValue(node, value, effect, control);
   return Replace(value);
-}
-
-// ES #sec-object.is
-Reduction JSBuiltinReducer::ReduceObjectIs(Node* node) {
-  // TODO(turbofan): At some point we should probably introduce a new
-  // SameValue simplified operator (and also a StrictEqual simplified
-  // operator) and create unified handling in SimplifiedLowering.
-  JSCallReduction r(node);
-  if (r.GetJSCallArity() == 2 && r.left() == r.right()) {
-    // Object.is(x,x) => #true
-    Node* value = jsgraph()->TrueConstant();
-    return Replace(value);
-  } else if (r.InputsMatchTwo(Type::Unique(), Type::Unique())) {
-    // Object.is(x:Unique,y:Unique) => ReferenceEqual(x,y)
-    Node* left = r.GetJSCallInput(0);
-    Node* right = r.GetJSCallInput(1);
-    Node* value = graph()->NewNode(simplified()->ReferenceEqual(), left, right);
-    return Replace(value);
-  } else if (r.InputsMatchTwo(Type::MinusZero(), Type::Any())) {
-    // Object.is(x:MinusZero,y) => ObjectIsMinusZero(y)
-    Node* input = r.GetJSCallInput(1);
-    Node* value = graph()->NewNode(simplified()->ObjectIsMinusZero(), input);
-    return Replace(value);
-  } else if (r.InputsMatchTwo(Type::Any(), Type::MinusZero())) {
-    // Object.is(x,y:MinusZero) => ObjectIsMinusZero(x)
-    Node* input = r.GetJSCallInput(0);
-    Node* value = graph()->NewNode(simplified()->ObjectIsMinusZero(), input);
-    return Replace(value);
-  } else if (r.InputsMatchTwo(Type::NaN(), Type::Any())) {
-    // Object.is(x:NaN,y) => ObjectIsNaN(y)
-    Node* input = r.GetJSCallInput(1);
-    Node* value = graph()->NewNode(simplified()->ObjectIsNaN(), input);
-    return Replace(value);
-  } else if (r.InputsMatchTwo(Type::Any(), Type::NaN())) {
-    // Object.is(x,y:NaN) => ObjectIsNaN(x)
-    Node* input = r.GetJSCallInput(0);
-    Node* value = graph()->NewNode(simplified()->ObjectIsNaN(), input);
-    return Replace(value);
-  } else if (r.InputsMatchTwo(Type::String(), Type::String())) {
-    // Object.is(x:String,y:String) => StringEqual(x,y)
-    Node* left = r.GetJSCallInput(0);
-    Node* right = r.GetJSCallInput(1);
-    Node* value = graph()->NewNode(simplified()->StringEqual(), left, right);
-    return Replace(value);
-  }
-  return NoChange();
 }
 
 // ES6 section 21.1.2.1 String.fromCharCode ( ...codeUnits )
@@ -2590,9 +2407,8 @@ Reduction JSBuiltinReducer::ReduceStringCharAt(Node* node) {
         }
 
         // Determine the {receiver} length.
-        Node* receiver_length = effect = graph()->NewNode(
-            simplified()->LoadField(AccessBuilder::ForStringLength()), receiver,
-            effect, control);
+        Node* receiver_length =
+            graph()->NewNode(simplified()->StringLength(), receiver);
 
         // Check if {index} is less than {receiver} length.
         Node* check = graph()->NewNode(simplified()->NumberLessThan(), index,
@@ -2602,8 +2418,12 @@ Reduction JSBuiltinReducer::ReduceStringCharAt(Node* node) {
 
         // Return the character from the {receiver} as single character string.
         Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
+
+        Node* masked_index = graph()->NewNode(
+            simplified()->MaskIndexWithBound(), index, receiver_length);
+
         Node* vtrue = graph()->NewNode(simplified()->StringCharAt(), receiver,
-                                       index, if_true);
+                                       masked_index, if_true);
 
         // Return the empty string otherwise.
         Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
@@ -2644,9 +2464,8 @@ Reduction JSBuiltinReducer::ReduceStringCharCodeAt(Node* node) {
         }
 
         // Determine the {receiver} length.
-        Node* receiver_length = effect = graph()->NewNode(
-            simplified()->LoadField(AccessBuilder::ForStringLength()), receiver,
-            effect, control);
+        Node* receiver_length =
+            graph()->NewNode(simplified()->StringLength(), receiver);
 
         // Check if {index} is less than {receiver} length.
         Node* check = graph()->NewNode(simplified()->NumberLessThan(), index,
@@ -2656,8 +2475,12 @@ Reduction JSBuiltinReducer::ReduceStringCharCodeAt(Node* node) {
 
         // Load the character from the {receiver}.
         Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
+
+        Node* masked_index = graph()->NewNode(
+            simplified()->MaskIndexWithBound(), index, receiver_length);
+
         Node* vtrue = graph()->NewNode(simplified()->StringCharCodeAt(),
-                                       receiver, index, if_true);
+                                       receiver, masked_index, if_true);
 
         // Return NaN otherwise.
         Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
@@ -2708,34 +2531,6 @@ Reduction JSBuiltinReducer::ReduceStringConcat(Node* node) {
   return NoChange();
 }
 
-// ES6 String.prototype.indexOf(searchString [, position])
-// #sec-string.prototype.indexof
-Reduction JSBuiltinReducer::ReduceStringIndexOf(Node* node) {
-  // We need at least target, receiver and search_string parameters.
-  if (node->op()->ValueInputCount() >= 3) {
-    Node* search_string = NodeProperties::GetValueInput(node, 2);
-    Type* search_string_type = NodeProperties::GetType(search_string);
-    Node* position = (node->op()->ValueInputCount() >= 4)
-                         ? NodeProperties::GetValueInput(node, 3)
-                         : jsgraph()->ZeroConstant();
-    Type* position_type = NodeProperties::GetType(position);
-
-    if (search_string_type->Is(Type::String()) &&
-        position_type->Is(Type::SignedSmall())) {
-      if (Node* receiver = GetStringWitness(node)) {
-        RelaxEffectsAndControls(node);
-        node->ReplaceInput(0, receiver);
-        node->ReplaceInput(1, search_string);
-        node->ReplaceInput(2, position);
-        node->TrimInputCount(3);
-        NodeProperties::ChangeOp(node, simplified()->StringIndexOf());
-        return Changed(node);
-      }
-    }
-  }
-  return NoChange();
-}
-
 Reduction JSBuiltinReducer::ReduceStringIterator(Node* node) {
   if (Node* receiver = GetStringWitness(node)) {
     Node* effect = NodeProperties::GetEffectInput(node);
@@ -2744,32 +2539,20 @@ Reduction JSBuiltinReducer::ReduceStringIterator(Node* node) {
     Node* map = jsgraph()->HeapConstant(
         handle(native_context()->string_iterator_map(), isolate()));
 
-    // allocate new iterator
-    effect = graph()->NewNode(
-        common()->BeginRegion(RegionObservability::kNotObservable), effect);
-    Node* value = effect = graph()->NewNode(
-        simplified()->Allocate(Type::OtherObject(), NOT_TENURED),
-        jsgraph()->Constant(JSStringIterator::kSize), effect, control);
-    effect = graph()->NewNode(simplified()->StoreField(AccessBuilder::ForMap()),
-                              value, map, effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSObjectPropertiesOrHash()),
-        value, jsgraph()->EmptyFixedArrayConstant(), effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSObjectElements()), value,
-        jsgraph()->EmptyFixedArrayConstant(), effect, control);
+    // Allocate new iterator and attach the iterator to this string.
+    AllocationBuilder a(jsgraph(), effect, control);
+    a.Allocate(JSStringIterator::kSize, NOT_TENURED, Type::OtherObject());
+    a.Store(AccessBuilder::ForMap(), map);
+    a.Store(AccessBuilder::ForJSObjectPropertiesOrHash(),
+            jsgraph()->EmptyFixedArrayConstant());
+    a.Store(AccessBuilder::ForJSObjectElements(),
+            jsgraph()->EmptyFixedArrayConstant());
+    a.Store(AccessBuilder::ForJSStringIteratorString(), receiver);
+    a.Store(AccessBuilder::ForJSStringIteratorIndex(),
+            jsgraph()->SmiConstant(0));
+    Node* value = effect = a.Finish();
 
-    // attach the iterator to this string
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSStringIteratorString()),
-        value, receiver, effect, control);
-    effect = graph()->NewNode(
-        simplified()->StoreField(AccessBuilder::ForJSStringIteratorIndex()),
-        value, jsgraph()->SmiConstant(0), effect, control);
-
-    value = effect = graph()->NewNode(common()->FinishRegion(), value, effect);
-
-    // replace it
+    // Replace it.
     ReplaceWithValue(node, value, effect, control);
     return Replace(value);
   }
@@ -2788,9 +2571,7 @@ Reduction JSBuiltinReducer::ReduceStringIteratorNext(Node* node) {
     Node* index = effect = graph()->NewNode(
         simplified()->LoadField(AccessBuilder::ForJSStringIteratorIndex()),
         receiver, effect, control);
-    Node* length = effect = graph()->NewNode(
-        simplified()->LoadField(AccessBuilder::ForStringLength()), string,
-        effect, control);
+    Node* length = graph()->NewNode(simplified()->StringLength(), string);
 
     // branch0: if (index < length)
     Node* check0 =
@@ -2881,9 +2662,8 @@ Reduction JSBuiltinReducer::ReduceStringIteratorNext(Node* node) {
           simplified()->StringFromCodePoint(UnicodeEncoding::UTF16), vtrue0);
 
       // Update iterator.[[NextIndex]]
-      Node* char_length = etrue0 = graph()->NewNode(
-          simplified()->LoadField(AccessBuilder::ForStringLength()), vtrue0,
-          etrue0, if_true0);
+      Node* char_length =
+          graph()->NewNode(simplified()->StringLength(), vtrue0);
       index = graph()->NewNode(simplified()->NumberAdd(), index, char_length);
       etrue0 = graph()->NewNode(
           simplified()->StoreField(AccessBuilder::ForJSStringIteratorIndex()),
@@ -2912,6 +2692,59 @@ Reduction JSBuiltinReducer::ReduceStringIteratorNext(Node* node) {
 
     ReplaceWithValue(node, value, effect, control);
     return Replace(value);
+  }
+  return NoChange();
+}
+
+// ES section #sec-string.prototype.slice
+Reduction JSBuiltinReducer::ReduceStringSlice(Node* node) {
+  if (Node* receiver = GetStringWitness(node)) {
+    Node* start = node->op()->ValueInputCount() >= 3
+                      ? NodeProperties::GetValueInput(node, 2)
+                      : jsgraph()->UndefinedConstant();
+    Type* start_type = NodeProperties::GetType(start);
+    Node* end = node->op()->ValueInputCount() >= 4
+                    ? NodeProperties::GetValueInput(node, 3)
+                    : jsgraph()->UndefinedConstant();
+    Type* end_type = NodeProperties::GetType(end);
+    Node* effect = NodeProperties::GetEffectInput(node);
+    Node* control = NodeProperties::GetControlInput(node);
+
+    if (start_type->Is(type_cache_.kSingletonMinusOne) &&
+        end_type->Is(Type::Undefined())) {
+      Node* receiver_length =
+          graph()->NewNode(simplified()->StringLength(), receiver);
+
+      Node* check =
+          graph()->NewNode(simplified()->NumberEqual(), receiver_length,
+                           jsgraph()->ZeroConstant());
+      Node* branch = graph()->NewNode(common()->Branch(BranchHint::kFalse),
+                                      check, control);
+
+      Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
+      Node* vtrue = jsgraph()->EmptyStringConstant();
+
+      Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
+      Node* vfalse;
+      {
+        // We need to convince TurboFan that {receiver_length}-1 is a valid
+        // Unsigned32 value, so we just apply NumberToUint32 to the result
+        // of the subtraction, which is a no-op and merely acts as a marker.
+        Node* index =
+            graph()->NewNode(simplified()->NumberSubtract(), receiver_length,
+                             jsgraph()->OneConstant());
+        index = graph()->NewNode(simplified()->NumberToUint32(), index);
+        vfalse = graph()->NewNode(simplified()->StringCharAt(), receiver, index,
+                                  if_false);
+      }
+
+      control = graph()->NewNode(common()->Merge(2), if_true, if_false);
+      Node* value =
+          graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2),
+                           vtrue, vfalse, control);
+      ReplaceWithValue(node, value, effect, control);
+      return Replace(value);
+    }
   }
   return NoChange();
 }
@@ -3015,8 +2848,6 @@ Reduction JSBuiltinReducer::Reduce(Node* node) {
       return ReduceDateNow(node);
     case kDateGetTime:
       return ReduceDateGetTime(node);
-    case kFunctionBind:
-      return ReduceFunctionBind(node);
     case kGlobalIsFinite:
       reduction = ReduceGlobalIsFinite(node);
       break;
@@ -3041,9 +2872,9 @@ Reduction JSBuiltinReducer::Reduce(Node* node) {
       return ReduceCollectionIterator(node, JS_MAP_TYPE,
                                       Context::MAP_VALUE_ITERATOR_MAP_INDEX);
     case kMapIteratorNext:
-      return ReduceCollectionIteratorNext(node, OrderedHashMap::kEntrySize,
-                                          FIRST_MAP_ITERATOR_TYPE,
-                                          LAST_MAP_ITERATOR_TYPE);
+      return ReduceCollectionIteratorNext(
+          node, OrderedHashMap::kEntrySize, factory()->empty_ordered_hash_map(),
+          FIRST_MAP_ITERATOR_TYPE, LAST_MAP_ITERATOR_TYPE);
     case kMathAbs:
       reduction = ReduceMathAbs(node);
       break;
@@ -3161,9 +2992,6 @@ Reduction JSBuiltinReducer::Reduce(Node* node) {
     case kObjectCreate:
       reduction = ReduceObjectCreate(node);
       break;
-    case kObjectIs:
-      reduction = ReduceObjectIs(node);
-      break;
     case kSetEntries:
       return ReduceCollectionIterator(
           node, JS_SET_TYPE, Context::SET_KEY_VALUE_ITERATOR_MAP_INDEX);
@@ -3173,9 +3001,9 @@ Reduction JSBuiltinReducer::Reduce(Node* node) {
       return ReduceCollectionIterator(node, JS_SET_TYPE,
                                       Context::SET_VALUE_ITERATOR_MAP_INDEX);
     case kSetIteratorNext:
-      return ReduceCollectionIteratorNext(node, OrderedHashSet::kEntrySize,
-                                          FIRST_SET_ITERATOR_TYPE,
-                                          LAST_SET_ITERATOR_TYPE);
+      return ReduceCollectionIteratorNext(
+          node, OrderedHashSet::kEntrySize, factory()->empty_ordered_hash_set(),
+          FIRST_SET_ITERATOR_TYPE, LAST_SET_ITERATOR_TYPE);
     case kStringFromCharCode:
       reduction = ReduceStringFromCharCode(node);
       break;
@@ -3185,12 +3013,12 @@ Reduction JSBuiltinReducer::Reduce(Node* node) {
       return ReduceStringCharCodeAt(node);
     case kStringConcat:
       return ReduceStringConcat(node);
-    case kStringIndexOf:
-      return ReduceStringIndexOf(node);
     case kStringIterator:
       return ReduceStringIterator(node);
     case kStringIteratorNext:
       return ReduceStringIteratorNext(node);
+    case kStringSlice:
+      return ReduceStringSlice(node);
     case kStringToLowerCaseIntl:
       return ReduceStringToLowerCaseIntl(node);
     case kStringToUpperCaseIntl:
